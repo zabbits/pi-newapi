@@ -1,0 +1,15 @@
+{
+  "discovery": true,
+  "models": ["o3-pro", "team-claude"],
+  "modelOverrides": {
+    "o3-pro": {
+      "api": "openai-responses"
+    },
+    "team-claude": {
+      "reference": { "provider": "anthropic", "id": "claude-sonnet-4-5" },
+      "api": "anthropic-messages",
+      "contextWindow": 100000,
+      "maxTokens": 16000
+    }
+  }
+}

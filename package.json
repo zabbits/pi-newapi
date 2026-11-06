@@ -1,0 +1,40 @@
+{
+  "name": "pi-newapi",
+  "version": "0.1.0",
+  "description": "NewAPI gateway provider with API-key authentication and model discovery for pi",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "newapi"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "newapi.example.json",
+    ".env.example"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "validate:newapi": "node scripts/validate-newapi.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.0",
+    "@earendil-works/pi-ai": "^1.5.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3",
+    "@earendil-works/pi-ai": "1.5.0"
+  }
+}
