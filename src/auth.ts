@@ -7,11 +7,15 @@ export function validateKey(key: string): string {
   return trimmed;
 }
 // Like pi's Cloudflare auth: the saved key and gateway form one provider credential.
+export async function resolveBaseUrl(config: NewApiConfig, credential: ApiKeyCredential | undefined, ctx: AuthContext) {
+  const base = credential?.env?.NEWAPI_BASE_URL ?? config.baseUrl ?? await ctx.env("NEWAPI_BASE_URL");
+  return base ? normalizeBaseUrl(base) : undefined;
+}
 export async function resolveConnection(config: NewApiConfig, credential: ApiKeyCredential | undefined, ctx: AuthContext) {
   const key = credential?.key ?? await ctx.env("NEWAPI_API_KEY");
-  const base = credential?.env?.NEWAPI_BASE_URL ?? config.baseUrl ?? await ctx.env("NEWAPI_BASE_URL");
-  if (!key || !base) return undefined;
-  return { key: validateKey(key), baseUrl: normalizeBaseUrl(base) };
+  const baseUrl = await resolveBaseUrl(config, credential, ctx);
+  if (!key || !baseUrl) return undefined;
+  return { key: validateKey(key), baseUrl };
 }
 export function newApiAuth(config: NewApiConfig): ApiKeyAuth {
   return {

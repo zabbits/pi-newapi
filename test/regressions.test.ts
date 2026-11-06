@@ -94,7 +94,7 @@ test("host-configured API keys restore offline caches and invalidate them after 
       const host = await ModelRuntime.create({ credentials, modelsStore, modelsPath, refreshOnCreate: false });
       host.registerNativeProvider(createNewApiProvider(parseConfig({ baseUrl: "https://gateway.example" }, {}), {
         authContext: noAmbientAuth,
-        resolveAuth: (signal) => host.getAuth("newapi", { signal }),
+        resolveAuth: (signal, credential) => host.getProvider("newapi")!.auth.apiKey!.resolve({ ctx: noAmbientAuth, credential, signal }),
         fetch: async (_url, init) => {
           calls++;
           assert.equal(new Headers(init?.headers).get("authorization"), "Bearer configured-key");
@@ -113,6 +113,75 @@ test("host-configured API keys restore offline caches and invalidate them after 
     await configure("changed-key");
     await offline.refresh({ providers: ["newapi"], allowNetwork: false });
     assert.equal(offline.getModels("newapi").length, 0);
+    assert.equal(calls, 1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("static models register before a request-time API key is supplied", async () => {
+  const runtime = createModels({ authContext: noAmbientAuth });
+  const provider = createNewApiProvider(parseConfig({ baseUrl: "https://gateway.example", discovery: false, models: ["gpt-4o"] }, {}), {
+    authContext: noAmbientAuth,
+    fetch: async () => { throw new Error("Static mode must not fetch a catalog"); },
+  });
+  runtime.setProvider(provider);
+  assert.equal((await runtime.refresh({ allowNetwork: false })).errors.size, 0);
+  const model = runtime.getModel("newapi", "gpt-4o");
+  assert.ok(model, "Model selection must succeed without a saved or environment key");
+  assert.equal(provider.getStatus().state, "static");
+  assert.equal((await runtime.getAvailable("newapi")).length, 0);
+  let dispatched = false;
+  const result = await runtime.completeSimple(model, context, { apiKey: "inline-key", onPayload(payload) {
+    assert.equal((payload as { model: string }).model, "gpt-4o");
+    dispatched = true;
+    throw new Error("captured inline-key request");
+  } });
+  assert.equal(dispatched, true);
+  assert.match(result.errorMessage ?? "", /captured inline-key request/);
+});
+
+test("discovery uses host access headers with saved keys and scopes cached catalogs to them", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "newapi-access-"));
+  try {
+    const modelsPath = join(directory, "models.json");
+    const configure = (secret: string) => writeFile(modelsPath, JSON.stringify({ providers: { newapi: {
+      apiKey: "unused-configured-key",
+      headers: { "CF-Access-Client-Id": "access-client", "CF-Access-Client-Secret": secret, aCcEpT: "application/vnd.newapi+json" },
+    } } }));
+    await configure("access-secret");
+    const credentials = new InMemoryCredentialStore();
+    await credentials.modify("newapi", async () => ({ type: "api_key", key: "saved-key", env: { NEWAPI_BASE_URL: "https://saved.example" } }));
+    const modelsStore = new InMemoryModelsStore();
+    let calls = 0;
+    const makeHost = async () => {
+      const host = await ModelRuntime.create({ credentials, modelsStore, modelsPath, refreshOnCreate: false });
+      host.registerNativeProvider(createNewApiProvider(parseConfig({ baseUrl: "https://unused.example" }, {}), {
+        authContext: noAmbientAuth,
+        resolveAuth: (signal, credential) => host.getProvider("newapi")!.auth.apiKey!.resolve({ ctx: noAmbientAuth, credential, signal }),
+        fetch: async (url, init) => {
+          calls++;
+          assert.equal(url, "https://saved.example/v1/models");
+          const headers = new Headers(init?.headers);
+          assert.equal(headers.get("authorization"), "Bearer saved-key");
+          assert.equal(headers.get("cf-access-client-id"), "access-client");
+          assert.equal(headers.get("cf-access-client-secret"), "access-secret");
+          assert.equal(headers.get("accept"), "application/vnd.newapi+json");
+          return new Response(JSON.stringify({ data: [{ id: "gpt-4o", supported_endpoint_types: ["openai"] }] }));
+        },
+      }));
+      return host;
+    };
+    const online = await makeHost();
+    assert.equal((await online.refresh({ providers: ["newapi"], allowNetwork: true })).errors.size, 0);
+    assert.equal(online.getModels("newapi").length, 1);
+    const snapshot = JSON.stringify(await modelsStore.read("newapi"));
+    for (const secret of ["saved-key", "access-client", "access-secret"]) assert.ok(!snapshot.includes(secret));
+    const offline = await makeHost();
+    assert.equal((await offline.refresh({ providers: ["newapi"], allowNetwork: false })).errors.size, 0);
+    assert.equal(offline.getModels("newapi").length, 1);
+    assert.equal(calls, 1);
+    await configure("changed-access-secret");
+    assert.equal((await offline.refresh({ providers: ["newapi"], allowNetwork: false })).errors.size, 0);
+    assert.equal(offline.getModels("newapi").length, 0, "Changed access headers must invalidate the old catalog");
     assert.equal(calls, 1);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

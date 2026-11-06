@@ -23,6 +23,9 @@ const thoughtSignature = Buffer.from("signed-gemini-fixture").toString("base64")
 await writeFile(fixture, marker);
 const captured: Array<{ url: string; body: any }> = [];
 const image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
+const accessClient = "validation-client";
+const accessSecret = randomBytes(24).toString("hex");
+let protectedCatalogRequests = 0;
 
 // The upstream is controlled; authentication, catalog generation, routing and
 // protocol handling between pi and this upstream run through real NewAPI.
@@ -62,6 +65,19 @@ function respond(res: ServerResponse, url: string, done: boolean) {
 }
 const upstream = createServer(async (req, res) => {
   try {
+    // An access-controlled proxy in front of NewAPI's actual catalog endpoint.
+    if (req.url === "/gateway/v1/models") {
+      protectedCatalogRequests++;
+      if (req.headers["cf-access-client-id"] !== accessClient || req.headers["cf-access-client-secret"] !== accessSecret) {
+        res.writeHead(403).end();
+        return;
+      }
+      const response = await fetch(`${base}/v1/models`, {
+        headers: { Authorization: req.headers.authorization ?? "" }, signal: AbortSignal.timeout(5000),
+      });
+      res.writeHead(response.status, { "Content-Type": "application/json" }).end(await response.text());
+      return;
+    }
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
@@ -192,16 +208,44 @@ try {
   console.log("Verified package installation, fresh pi CLI startup with stored credentials, then offline cached listing");
   const saved = await readFile(join(agentDir, "models-store.json"), "utf8");
   assert.ok(!saved.includes(key));
-  // Also exercise the installed extension's host-auth bridge: no saved token or
-  // environment key, only pi's models.json credential and the gateway setting.
-  await rm(join(agentDir, "auth.json"));
-  await writeFile(join(agentDir, "newapi.json"), JSON.stringify({ baseUrl: base, modelOverrides: config.modelOverrides }));
-  await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers: { newapi: { apiKey: key } } }), { mode: 0o600 });
-  const configured = await run(cli, [...args, "--list-models", "newapi"], options);
-  assert.match(configured.stdout, /team-gemini/);
-  const configuredOffline = await run(cli, [...args, "--offline", "--list-models", "newapi"], options);
-  assert.match(configuredOffline.stdout, /team-gemini/);
-  console.log("Verified installed extension offline with a models.json API key");
+  // A header-protected catalog must work regardless of the relay key's source.
+  const protectedBase = `http://127.0.0.1:${upstreamAddress.port}/gateway`;
+  await writeFile(join(agentDir, "newapi.json"), JSON.stringify({ baseUrl: protectedBase, modelOverrides: config.modelOverrides }));
+  for (const source of ["saved", "configured", "environment"]) {
+    await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers: { newapi: {
+      apiKey: source === "configured" ? key : source === "saved" ? "unused-configured-key" : undefined,
+      headers: { "CF-Access-Client-Id": accessClient, "CF-Access-Client-Secret": "${NEWAPI_TEST_ACCESS_SECRET}" },
+    } } }), { mode: 0o600 });
+    if (source === "saved") {
+      await writeFile(join(agentDir, "auth.json"), JSON.stringify({ newapi: { type: "api_key", key, env: { NEWAPI_BASE_URL: protectedBase } } }), { mode: 0o600 });
+    } else await rm(join(agentDir, "auth.json"), { force: true });
+    await rm(join(agentDir, "models-store.json"), { force: true });
+    const protectedOptions = { ...options, env: { ...options.env, NEWAPI_TEST_ACCESS_SECRET: accessSecret,
+      ...(source === "environment" ? { NEWAPI_API_KEY: key } : {}),
+    } };
+    const before = protectedCatalogRequests;
+    const listing = await run(cli, [...args, "--list-models", "newapi"], protectedOptions);
+    assert.match(listing.stdout, /team-gemini/);
+    assert.ok(protectedCatalogRequests > before, `${source}: no authenticated discovery request reached the proxy`);
+    const after = protectedCatalogRequests;
+    const cached = await run(cli, [...args, "--offline", "--list-models", "newapi"], protectedOptions);
+    assert.match(cached.stdout, /team-gemini/);
+    assert.equal(protectedCatalogRequests, after);
+    const snapshot = await readFile(join(agentDir, "models-store.json"), "utf8");
+    for (const secret of [key, accessClient, accessSecret]) assert.ok(!snapshot.includes(secret));
+    console.log(`Verified protected discovery and offline cache with a ${source} key`);
+  }
+  // No credentials or cache: pi must select the static model before applying --api-key.
+  const inlineAgentDir = join(directory, "inline-agent");
+  await mkdir(inlineAgentDir);
+  await writeFile(join(inlineAgentDir, "newapi.json"), JSON.stringify({ baseUrl: base, discovery: false, models: ["o3-pro"] }));
+  const inlineOptions = { ...options, env: { ...options.env, PI_CODING_AGENT_DIR: inlineAgentDir } };
+  await run(cli, ["install", packagePath], inlineOptions);
+  const inline = run(cli, [...args, "--offline", "--provider", "newapi", "--model", "o3-pro", "--api-key", key,
+    "--no-session", "--tools", "read", "--print", "Read the fixture."], inlineOptions);
+  inline.child.stdin?.end();
+  assert.match((await inline).stdout, /NewAPI verified\./);
+  console.log("Verified first-run static CLI inference and tool round trip with --api-key");
   console.log("Real NewAPI validation passed.");
 } catch (error) {
   console.error("Validation failed:", error);

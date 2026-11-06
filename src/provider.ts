@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
 import {
   createProvider, defaultProviderAuthContext,
-  type AuthContext, type AuthResult, type ModelsStoreEntry, type Provider, type RefreshModelsContext,
+  type ApiKeyCredential, type AuthContext, type AuthResult, type ModelsStoreEntry,
+  type Provider, type ProviderHeaders, type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
-import { newApiAuth, resolveConnection } from "./auth.ts";
+import { newApiAuth, resolveBaseUrl, resolveConnection } from "./auth.ts";
 import { buildCatalog, catalogVersion, parseCatalog, type CatalogReport } from "./catalog.ts";
 import { APIS, isRecord, type ChatApi, type ChatModel, type NewApiConfig } from "./config.ts";
 import { resolveRequestModel, streamWithReference } from "./stream.ts";
@@ -22,11 +23,19 @@ export interface ProviderStatus {
 interface Snapshot extends ModelsStoreEntry { newapi: { scope: string; report: CatalogReport } }
 export interface NewApiProvider extends Provider<ChatApi> { getStatus(): ProviderStatus }
 
-export async function fetchCatalog(baseUrl: string, key: string, signal: AbortSignal, fetcher: typeof fetch = fetch) {
+function discoveryHeaders(key: string, configured?: ProviderHeaders): Headers {
+  const headers = new Headers({ Authorization: `Bearer ${key}`, Accept: "application/json" });
+  for (const [name, value] of Object.entries(configured ?? {})) {
+    if (value === null) headers.delete(name);
+    else headers.set(name, value);
+  }
+  return headers;
+}
+export async function fetchCatalog(baseUrl: string, headers: Headers, signal: AbortSignal, fetcher: typeof fetch = fetch) {
   const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10000)]);
   try {
     const response = await fetcher(`${baseUrl}/models`, {
-      headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+      headers,
       redirect: "error", signal: requestSignal,
     });
     if (!response.ok) throw new CatalogError(`NewAPI model discovery failed (HTTP ${response.status}).${response.status === 401 || response.status === 403 ? " Check the API token and its permissions." : " Check gateway availability."}`, response.status);
@@ -64,8 +73,8 @@ function restore(stored: RefreshModelsContext["stored"], scope: string): Snapsho
 export interface ProviderOptions {
   fetch?: typeof fetch;
   authContext?: AuthContext;
-  /** Resolve pi's configured API key during its cache-only initialization phase. */
-  resolveAuth?: (signal: AbortSignal) => Promise<AuthResult | undefined>;
+  /** Resolve provider-wide auth, including headers, using the refresh credential. */
+  resolveAuth?: (signal: AbortSignal, credential?: ApiKeyCredential) => Promise<AuthResult | undefined>;
 }
 export function createNewApiProvider(config: NewApiConfig, options: ProviderOptions = {}): NewApiProvider {
   const authContext = options.authContext ?? defaultProviderAuthContext();
@@ -95,13 +104,37 @@ export function createNewApiProvider(config: NewApiConfig, options: ProviderOpti
       (request, transcript, requestOptions) => dispatch.streamSimple(request, transcript, requestOptions)),
     async refreshModels(context) {
       let credential = context.credential?.type === "api_key" ? context.credential : undefined;
-      let connection: Awaited<ReturnType<typeof resolveConnection>>;
-      try {
-        if (!credential && options.resolveAuth) {
-          const resolved = await options.resolveAuth(context.signal);
-          if (resolved?.auth.apiKey) credential = { type: "api_key", key: resolved.auth.apiKey, env: resolved.env };
+      // Static model selection precedes pi's --api-key handling. Only the URL
+      // and model definitions are needed here; request-time auth still applies.
+      if (!config.discovery) {
+        try {
+          const baseUrl = await resolveBaseUrl(config, credential, authContext);
+          context.signal.throwIfAborted();
+          const built = baseUrl ? buildCatalog(config.models!.map((id) => ({ id, endpoints: [] })), config, baseUrl) : undefined;
+          await context.publish({ update: () => {
+            models = built?.models ?? [];
+            scope = undefined;
+            status = built ? { state: "static", report: built.report } : { state: "unconfigured", report: emptyReport() };
+          } });
+        } catch (error) {
+          context.signal.throwIfAborted();
+          await context.publish({ update: () => {
+            models = [];
+            scope = undefined;
+            status = { state: "empty", report: emptyReport(), error: error instanceof Error ? error.message : "NewAPI static model configuration failed." };
+          } });
+          throw error;
         }
+        return;
+      }
+      let connection: Awaited<ReturnType<typeof resolveConnection>>;
+      let headers: Headers;
+      try {
+        const resolved = await options.resolveAuth?.(context.signal, credential)
+          ?? await dispatch.auth.apiKey!.resolve({ ctx: authContext, credential, signal: context.signal });
+        if (resolved?.auth.apiKey) credential = { type: "api_key", key: resolved.auth.apiKey, env: resolved.env };
         connection = await resolveConnection(config, credential, authContext);
+        headers = connection ? discoveryHeaders(connection.key, resolved?.auth.headers) : new Headers();
       }
       catch (error) {
         context.signal.throwIfAborted();
@@ -118,8 +151,9 @@ export function createNewApiProvider(config: NewApiConfig, options: ProviderOpti
         return;
       }
       // Persist only a digest, never the token. Include config/catalog version so a
-      // changed gateway, token, override or pi catalog cannot resurrect stale models.
-      const nextScope = createHash("sha256").update(JSON.stringify([3, connection, config, catalogVersion()])).digest("hex");
+      // changed gateway, token, access headers, override or pi catalog cannot
+      // resurrect stale models. Header values never enter the persisted snapshot.
+      const nextScope = createHash("sha256").update(JSON.stringify([4, connection, [...headers], config, catalogVersion()])).digest("hex");
       if (scope !== nextScope) {
         const cached = restore(context.stored, nextScope);
         if (!await context.publish({ update: () => {
@@ -130,15 +164,10 @@ export function createNewApiProvider(config: NewApiConfig, options: ProviderOpti
         } })) return;
       }
       try {
-        if (!config.discovery) {
-          const built = buildCatalog(config.models!.map((id) => ({ id, endpoints: [] })), config, connection.baseUrl);
-          await context.publish({ update: () => { models = built.models; status = { state: "static", report: built.report }; } });
-          return;
-        }
         if (!context.allowNetwork || context.signal.aborted) return;
         const age = status.checkedAt === undefined ? undefined : Date.now() - status.checkedAt;
         if (!context.force && age !== undefined && age >= 0 && age < 5 * 60 * 1000) return;
-        const catalog = await fetchCatalog(connection.baseUrl, connection.key, context.signal, fetcher);
+        const catalog = await fetchCatalog(connection.baseUrl, headers, context.signal, fetcher);
         const built = buildCatalog(catalog.entries, config, connection.baseUrl, catalog.skipped);
         const checkedAt = Date.now();
         const snapshot: Snapshot = { models: built.models, checkedAt, newapi: { scope: nextScope, report: built.report } };

@@ -10,7 +10,7 @@ export default async function newApiExtension(pi: ExtensionAPI): Promise<void> {
   const authContext = defaultProviderAuthContext();
   const provider = createNewApiProvider(config, {
     authContext,
-    resolveAuth: async (signal) => host?.getProvider("newapi")?.auth.apiKey?.resolve({ ctx: authContext, signal }),
+    resolveAuth: async (signal, credential) => host?.getProvider("newapi")?.auth.apiKey?.resolve({ ctx: authContext, credential, signal }),
   });
   pi.registerProvider(provider);
   // pi 1.5 resolves an explicit --model before its background catalog refresh.

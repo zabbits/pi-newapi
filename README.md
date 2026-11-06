@@ -42,7 +42,7 @@ pi -e ./src/index.ts --list-models newapi
 - `/reload` reloads the extension and `newapi.json` after configuration changes.
 - `pi --offline --list-models newapi` uses the cached catalog without network discovery. Offline mode does not provide local inference.
 
-Successful catalogs are stored in pi's `models-store.json`, with a five-minute refresh interval. A temporary gateway failure retains the last usable catalog and reports the error. HTTP 401/403 clears it. Cache entries are scoped to the gateway, token, extension configuration, and pi catalog version; changing credentials cannot restore another token's catalog. No raw API key is written to the model cache.
+Successful catalogs are stored in pi's `models-store.json`, with a five-minute refresh interval. A temporary gateway failure retains the last usable catalog and reports the error. HTTP 401/403 clears it. Cache entries are scoped to the gateway, token, resolved discovery headers, extension configuration, and pi catalog version; changing credentials or access headers cannot restore the previous catalog. Raw API keys and access headers are not written to the model cache.
 
 If discovery fails on the first connection, the provider remains registered so `/login` and `/newapi refresh` can recover it. Without a prior cache or explicit static configuration, there are no models to select.
 
@@ -118,6 +118,8 @@ Environment settings override the corresponding JSON fields. A saved login's URL
 
 Pi's `models.json` can also supply `providers.newapi.apiKey`; offline restoration uses that same resolved key. Supply the discovery gateway through `newapi.json` or `NEWAPI_BASE_URL`. Explicit `models.json` endpoint overrides control inference URLs without changing the discovery URL.
 
+Provider-wide `providers.newapi.headers` in `models.json` apply to both discovery and inference, including gateways protected by Cloudflare Access. Header values use pi's normal configuration resolution, including environment references such as `${CF_ACCESS_CLIENT_SECRET}`. This works with saved login credentials, environment keys, and `models.json` keys. Model-specific headers apply only to inference.
+
 If your server disables `/v1/models`, use static mode with an explicit list and verified settings:
 
 ```json
@@ -138,6 +140,13 @@ If your server disables `/v1/models`, use static mode with an explicit list and 
 
 Replace these example capabilities with those supported by your model and channel. Static mode performs no discovery and cannot verify token access. `NEWAPI_MODELS` by itself remains an allowlist and does not enable static mode.
 
+Static models register as soon as a gateway URL is available, even before you supply an API key. With the static configuration above, you can provide the token for a single invocation:
+
+```sh
+NEWAPI_BASE_URL='https://your-newapi-instance.example' \
+  pi --provider newapi --model my-model --api-key 'sk-your-newapi-token'
+```
+
 Gateway prices can differ from upstream prices and depend on token groups and channel settings. The extension therefore does not copy upstream prices. Unconfigured rates are zero in pi's cost display and reported as **unknown** by `/newapi`; this does not mean requests are free. Set per-model `cost` rates (`input`, `output`, `cacheRead`, `cacheWrite`, in currency units per million tokens) if you need estimates. Omitted rates remain zero. NewAPI's billing is authoritative.
 
 ## Validation and development
@@ -156,7 +165,7 @@ To exercise the actual gateway and installed extension:
 NEWAPI_TEST_BINARY=/absolute/path/to/new-api npm run validate:newapi
 ```
 
-[scripts/validate-newapi.ts](scripts/validate-newapi.ts) starts the official NewAPI executable with a fresh temporary database and creates local test channels and relay tokens. It checks the real `/v1/models` output, filtering, all four inference protocols, images, reasoning settings, streamed tool calls and results, a Gemini alias with signed tool-history replay, token restrictions/revocation, package installation, first-run CLI use, and offline persistence with both saved and `models.json` credentials. It removes its temporary data afterward. `PI_TEST_CLI` can select another pi executable.
+[scripts/validate-newapi.ts](scripts/validate-newapi.ts) starts the official NewAPI executable with a fresh temporary database and creates local test channels and relay tokens. It checks the real `/v1/models` output, filtering, all four inference protocols, images, reasoning settings, streamed tool calls and results, a Gemini alias with signed tool-history replay, token restrictions/revocation, package installation, first-run CLI use with saved credentials and static `--api-key` configuration, and header-protected discovery and offline persistence with saved, environment, and `models.json` keys. It removes its temporary data afterward. `PI_TEST_CLI` can select another pi executable.
 
 The upstream responses are deterministic fixtures. The test validates pi → NewAPI → upstream routing and protocol handling; it does not call a paid model service or establish the capabilities of your own gateway's aliases. The validated combination is pi 1.5.0 and NewAPI v1.0.0-rc.48.
 
